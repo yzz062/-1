@@ -1,0 +1,188 @@
+#include <iostream>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <vector>
+#include <cmath>
+#include <thread>
+
+
+struct PointXYZNormal {
+    PCL_ADD_POINT4D;
+    PCL_ADD_NORMAL4D;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+} EIGEN_ALIGN16;
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZNormal,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, normal_x, normal_x)
+    (float, normal_y, normal_y)
+    (float, normal_z, normal_z)
+)
+
+float calculateSigmaZ(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, const std::vector<int>& neighbors) {
+    if (neighbors.empty()) return 0.0f;
+    float z_sum = 0.0f;
+    for (int idx : neighbors) z_sum += cloud->points[idx].z;
+    float z_mean = z_sum / neighbors.size();
+    float variance = 0.0f;
+    for (int idx : neighbors) {
+        float diff = cloud->points[idx].z - z_mean;
+        variance += diff * diff;
+    }
+    return std::sqrt(variance / neighbors.size());
+}
+
+
+bool checkNormalConsistency(const pcl::Normal& n1, const pcl::Normal& n2, float theta_threshold) {
+    float dx = n1.normal_x - n2.normal_x;
+    float dy = n1.normal_y - n2.normal_y;
+    float dz = n1.normal_z - n2.normal_z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz) <= theta_threshold;
+}
+
+
+void correctNormalsAlongPath(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    pcl::PointCloud<pcl::Normal>::Ptr& normals,
+    const pcl::search::KdTree<pcl::PointXYZ>::Ptr& tree,
+    int start_idx, float theta_threshold, float step_size, int max_steps = 20) {
+    std::vector<int> path;
+    path.push_back(start_idx);
+    int current_idx = start_idx;
+    int steps = 0;
+    bool stable = false;
+
+    while (!stable && steps < max_steps) {
+        pcl::PointXYZ current_point = cloud->points[current_idx];
+        pcl::Normal current_normal = normals->points[current_idx];
+
+        pcl::PointXYZ search_point;
+        search_point.x = current_point.x + current_normal.normal_x * step_size;
+        search_point.y = current_point.y + current_normal.normal_y * step_size;
+        search_point.z = current_point.z + current_normal.normal_z * step_size;
+
+        std::vector<int> neighbor_idx(1);
+        std::vector<float> neighbor_dist(1);
+        if (tree->nearestKSearch(search_point, 1, neighbor_idx, neighbor_dist) != 1) break;
+
+        int next_idx = neighbor_idx[0];
+        if (checkNormalConsistency(normals->points[next_idx], current_normal, theta_threshold)) {
+            stable = true;
+        }
+        path.push_back(next_idx);
+        current_idx = next_idx;
+        steps++;
+    }
+
+    for (int i = path.size() - 2; i >= 0; --i) {
+        int curr = path[i];
+        int next = path[i + 1];
+        normals->points[curr].normal_x = 0.7f * normals->points[curr].normal_x + 0.3f * normals->points[next].normal_x;
+        normals->points[curr].normal_y = 0.7f * normals->points[curr].normal_y + 0.3f * normals->points[next].normal_y;
+        normals->points[curr].normal_z = 0.7f * normals->points[curr].normal_z + 0.3f * normals->points[next].normal_z;
+        float norm = std::sqrt(normals->points[curr].normal_x * normals->points[curr].normal_x +
+            normals->points[curr].normal_y * normals->points[curr].normal_y +
+            normals->points[curr].normal_z * normals->points[curr].normal_z);
+        if (norm > 1e-6) {
+            normals->points[curr].normal_x /= norm;
+            normals->points[curr].normal_y /= norm;
+            normals->points[curr].normal_z /= norm;
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    std::string file_path = "E:\\shuju\\knn_skeleton.pcd";
+    std::string output_path = "E:/shuju/XXX.pcd";
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(file_path, *cloud) == -1) {
+        std::cerr << "Error : Unable to read point cloud file " << file_path << std::endl;
+        return -1;
+    }
+    std::cout << "Load point cloud successfully, points:" << cloud->size() << std::endl;
+
+
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+    ne.setInputCloud(cloud);
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    ne.setSearchMethod(tree);
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    ne.setKSearch(50);
+    ne.compute(*normals);
+    std::cout << "Initial normal vector generation completed" << std::endl;
+
+
+    std::vector<bool> is_feature(cloud->size(), false);
+    const float sigma_z_threshold_flat = 0.05f;
+    const float sigma_z_threshold_rough = 0.2f;
+    const float curvature_threshold = 0.1f;
+    const int k_neighbors = 30;
+    int feature_count = 0;
+
+    for (int i = 0; i < cloud->size(); ++i) {
+        std::vector<int> neighbors_idx;
+        std::vector<float> neighbors_dist;
+        int found = tree->nearestKSearch(cloud->points[i], k_neighbors, neighbors_idx, neighbors_dist);
+        if (found < 5) continue;
+
+        float sigma_z = calculateSigmaZ(cloud, neighbors_idx);
+        float sigma_threshold = (sigma_z > 0.1f) ? sigma_z_threshold_rough : sigma_z_threshold_flat;
+
+        if (normals->points[i].curvature > curvature_threshold || sigma_z > sigma_threshold) {
+            is_feature[i] = true;
+            feature_count++;
+        }
+    }
+    std::cout << "Filter the number of feature points:" << feature_count << std::endl;
+
+    const float theta_threshold = 0.1f;
+    const float step_size = 0.02f;
+    for (int i = 0; i < cloud->size(); ++i) {
+        if (is_feature[i]) {
+            correctNormalsAlongPath(cloud, normals, tree, i, theta_threshold, step_size);
+        }
+    }
+
+    pcl::PointCloud<PointXYZNormal>::Ptr cloud_with_normals(new pcl::PointCloud<PointXYZNormal>);
+    cloud_with_normals->resize(cloud->size());
+
+    for (size_t i = 0; i < cloud->size(); ++i) {
+        cloud_with_normals->points[i].x = cloud->points[i].x;
+        cloud_with_normals->points[i].y = cloud->points[i].y;
+        cloud_with_normals->points[i].z = cloud->points[i].z;
+        cloud_with_normals->points[i].normal_x = normals->points[i].normal_x;
+        cloud_with_normals->points[i].normal_y = normals->points[i].normal_y;
+        cloud_with_normals->points[i].normal_z = normals->points[i].normal_z;
+    }
+
+    if (pcl::io::savePCDFile<PointXYZNormal>(output_path, *cloud_with_normals) == -1) {
+        std::cerr << "Warning: Unable to save point cloud file with normal vectors" << std::endl;
+    }
+    else {
+        std::cout << "The point cloud with normal vectors has been saved to:" << output_path << std::endl;
+        std::cout << "This file can be loaded directly in CloudCompare" << std::endl;
+    }
+
+    pcl::visualization::PCLVisualizer viewer("Point cloud and normal vector visualization");
+    viewer.setBackgroundColor(1, 1, 1);
+
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> cloud_color(cloud, 0, 0, 255);
+    viewer.addPointCloud<pcl::PointXYZ>(cloud, cloud_color, "original_cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "original_cloud");
+
+    viewer.addPointCloudNormals<pcl::PointXYZ, pcl::Normal>(cloud, normals, 10, 0.9, "normals");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_COLOR, 255, 0, 0, "normals");
+
+    std::cout << "The visualization window is activated, press Q to exit" << std::endl;
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce(100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    return 0;
+}

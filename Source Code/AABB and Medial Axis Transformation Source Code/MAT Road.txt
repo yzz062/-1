@@ -1,0 +1,237 @@
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <vector>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/features/boundary.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/search/kdtree.h>
+
+// Point cloud thinning function (reduce thinning intensity to retain more points)
+pcl::PointCloud<pcl::PointXYZ>::Ptr thinCloud(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, int iterations)
+{
+    pcl::PointCloud<pcl::PointXYZ>::Ptr thinned_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    *thinned_cloud = *cloud;
+
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+
+    for (int i = 0; i < iterations; ++i)
+    {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        tree->setInputCloud(thinned_cloud);
+
+        for (size_t j = 0; j < thinned_cloud->size(); ++j)
+        {
+            std::vector<int> neighbors_indices;
+            std::vector<float> neighbors_distances;
+
+            // Increase search radius to reduce the number of culled points
+            if (tree->radiusSearch(j, 0.01f, neighbors_indices, neighbors_distances) > 1)
+            {
+                // Lower the threshold to retain more points (originally 500)
+                if (neighbors_indices.size() < 500)
+                {
+                    temp_cloud->push_back(thinned_cloud->points[j]);
+                }
+            }
+            else
+            {
+                temp_cloud->push_back(thinned_cloud->points[j]);
+            }
+        }
+
+        thinned_cloud = temp_cloud;
+
+        if (thinned_cloud->size() < 10)  // Retain more skeleton points
+            break;
+    }
+
+    return thinned_cloud;
+}
+
+// Extract boundary points (retain more boundary points)
+pcl::PointCloud<pcl::PointXYZ>::Ptr extractBoundaryPoints(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud)
+{
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_downsampled(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::VoxelGrid<pcl::PointXYZ> voxelGrid;
+    voxelGrid.setInputCloud(cloud);
+    // Reduce voxel size to retain more original points (originally 0.03f)
+    voxelGrid.setLeafSize(0.03f, 0.03f, 0.03f);
+    voxelGrid.filter(*cloud_downsampled);
+
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+
+    tree->setInputCloud(cloud_downsampled);
+    ne.setInputCloud(cloud_downsampled);
+    ne.setSearchMethod(tree);
+    // Reduce the number of neighborhood points for normal estimation to increase boundary point recognition rate (originally 100)
+    ne.setKSearch(30);
+    ne.compute(*normals);
+
+    pcl::BoundaryEstimation<pcl::PointXYZ, pcl::Normal, pcl::Boundary> be;
+    pcl::PointCloud<pcl::Boundary>::Ptr boundaries(new pcl::PointCloud<pcl::Boundary>);
+
+    be.setInputCloud(cloud_downsampled);
+    be.setInputNormals(normals);
+    be.setSearchMethod(tree);
+    // Reduce the number of neighborhood points for boundary estimation to increase the number of boundary points (originally 100)
+    be.setKSearch(40);
+    be.compute(*boundaries);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr boundary_points(new pcl::PointCloud<pcl::PointXYZ>);
+    for (size_t i = 0; i < cloud_downsampled->size(); ++i)
+    {
+        if (boundaries->points[i].boundary_point)
+        {
+            boundary_points->push_back(cloud_downsampled->points[i]);
+        }
+    }
+
+    pcl::RadiusOutlierRemoval<pcl::PointXYZ> outlier_removal;
+    outlier_removal.setInputCloud(boundary_points);
+    // Adjust outlier removal parameters to retain more points (originally 5.0)
+    outlier_removal.setRadiusSearch(5.0);
+    outlier_removal.setMinNeighborsInRadius(1);
+    outlier_removal.filter(*boundary_points);
+
+    return boundary_points;
+}
+
+// Calculate connection relationships between points to generate more line segments
+std::vector<pcl::Vertices> computeSkeletonLines(pcl::PointCloud<pcl::PointXYZ>::Ptr skeleton, float max_distance)
+{
+    std::vector<pcl::Vertices> lines;
+    if (skeleton->size() < 2) return lines;
+
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(skeleton);
+
+    for (size_t i = 0; i < skeleton->size(); ++i)
+    {
+        std::vector<int> neighbors_indices;
+        std::vector<float> neighbors_distances;
+
+        // Search for more neighboring points
+        if (tree->radiusSearch(i, max_distance, neighbors_indices, neighbors_distances) > 1)
+        {
+            int count = 0;
+            // Connect each point to more neighbors (originally 2)
+            for (size_t j = 0; j < neighbors_indices.size() && count < 3; ++j)
+            {
+                int neighbor_idx = neighbors_indices[j];
+                if (neighbor_idx > i)
+                {
+                    pcl::Vertices line;
+                    line.vertices.push_back(i);
+                    line.vertices.push_back(neighbor_idx);
+                    lines.push_back(line);
+                    count++;
+                }
+            }
+        }
+    }
+
+    return lines;
+}
+
+// Window for displaying the original point cloud
+void visualizeOriginalCloud(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud)
+{
+    pcl::visualization::PCLVisualizer viewer("Original Point Cloud");
+    viewer.setBackgroundColor(0, 0, 0);
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> cloudColor(cloud, 255, 255, 255);
+    viewer.addPointCloud<pcl::PointXYZ>(cloud, cloudColor, "original_cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "original_cloud");
+    viewer.initCameraParameters();
+    viewer.resetCamera();
+
+    while (!viewer.wasStopped())
+    {
+        viewer.spinOnce(100);
+        std::this_thread::sleep_for(std::chrono::microseconds(100000));
+    }
+}
+
+// Window for displaying skeleton lines
+void visualizeSkeletonLines(pcl::PointCloud<pcl::PointXYZ>::Ptr skeleton, std::vector<pcl::Vertices> lines)
+{
+    pcl::visualization::PCLVisualizer viewer("Skeleton Lines");
+    viewer.setBackgroundColor(0, 0, 0);
+
+    // Display both skeleton points and lines for better observation
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> skeletonColor(skeleton, 255, 0, 0);
+    viewer.addPointCloud<pcl::PointXYZ>(skeleton, skeletonColor, "skeleton_points");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1.0, "skeleton_points");
+
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        if (lines[i].vertices.size() >= 2)
+        {
+            int idx1 = lines[i].vertices[0];
+            int idx2 = lines[i].vertices[1];
+            std::string line_id = "line_" + std::to_string(i);
+            viewer.addLine<pcl::PointXYZ>(skeleton->points[idx1], skeleton->points[idx2], 0.0f, 1.0f, 0.0f, line_id);
+            viewer.setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_LINE_WIDTH, 2, line_id);
+        }
+    }
+
+    viewer.initCameraParameters();
+    viewer.resetCamera();
+
+    while (!viewer.wasStopped())
+    {
+        viewer.spinOnce(100);
+        std::this_thread::sleep_for(std::chrono::microseconds(100000));
+    }
+}
+
+int main(int argc, char** argv)
+{
+    std::string inputFileName = "E:\\点云数据\\jianzhu.pcd";
+    std::string outputFileName = "skeleton.pcd";
+
+    if (argc >= 2) inputFileName = argv[1];
+    if (argc >= 3) outputFileName = argv[2];
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(inputFileName, *cloud) == -1)
+    {
+        PCL_ERROR("Failed to read PCD file!\n");
+        return -1;
+    }
+
+    std::cout << "Successfully read point cloud, number of points: " << cloud->size() << std::endl;
+
+    // Extract boundary points
+    pcl::PointCloud<pcl::PointXYZ>::Ptr boundary_points = extractBoundaryPoints(cloud);
+    std::cout << "Number of extracted boundary points: " << boundary_points->size() << std::endl;
+
+    // Reduce the number of iterations to retain more skeleton points (originally 2)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr skeleton = thinCloud(boundary_points, 1);
+    std::cout << "Number of skeleton points: " << skeleton->size() << std::endl;
+
+    // Increase maximum connection distance to generate more line segments (originally 0.05f)
+    std::vector<pcl::Vertices> skeleton_lines = computeSkeletonLines(skeleton, 1.0f);
+    std::cout << "Number of generated skeleton line segments: " << skeleton_lines.size() << std::endl;
+
+    if (pcl::io::savePCDFileASCII(outputFileName, *skeleton) == -1)
+    {
+        PCL_ERROR("Failed to save skeleton point cloud file!\n");
+        return -1;
+    }
+    std::cout << "Skeleton point cloud saved to: " << outputFileName << std::endl;
+
+    std::thread original_cloud_thread(&visualizeOriginalCloud, cloud);
+    std::thread skeleton_thread(&visualizeSkeletonLines, skeleton, skeleton_lines);
+
+    original_cloud_thread.join();
+    skeleton_thread.join();
+
+    return 0;
+}
