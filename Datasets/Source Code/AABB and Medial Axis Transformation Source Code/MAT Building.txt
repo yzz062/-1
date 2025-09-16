@@ -1,0 +1,378 @@
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <vector>
+#include <algorithm>
+#include <cmath>  // For mathematical calculations
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/features/boundary.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/common/common.h>
+
+// Custom angle conversion function (replaces PCL's rad2deg to address missing header issue)
+inline float rad2deg(float radians) {
+    return radians * (180.0f / static_cast<float>(M_PI));
+}
+
+// Type alias (reduces pointer copying overhead)
+using PointCloudPtr = pcl::PointCloud<pcl::PointXYZ>::Ptr;
+using KdTreePtr = pcl::search::KdTree<pcl::PointXYZ>::Ptr;
+
+// Point cloud statistical features (includes angle sensitivity parameter)
+struct CloudStats {
+    float max_dim;         // Maximum dimension
+    float avg_spacing;     // Average point spacing
+    float angle_sensitivity;  // Angle feature sensitivity (slope edge adaptation)
+};
+
+// Compute point cloud statistical features (optimized sampling for large datasets)
+CloudStats computeCloudStats(PointCloudPtr cloud) {
+    // Basic scale calculation (fast boundary extraction)
+    pcl::PointXYZ min_pt, max_pt;
+    pcl::getMinMax3D(*cloud, min_pt, max_pt);
+    float dim_x = max_pt.x - min_pt.x;
+    float dim_y = max_pt.y - min_pt.y;
+    float dim_z = max_pt.z - min_pt.z;
+    float max_dim = std::max({ dim_x, dim_y, dim_z });
+
+    // Specialized sampling strategy for large datasets (minimal sampling)
+    KdTreePtr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(cloud);
+    float total_dist = 0.0f;
+    int count = 0;
+    // 800K point optimization: significantly reduce sampling density (1 sample per 20000 points)
+    size_t sample_step = std::max<size_t>(200, cloud->size() / 20000);
+
+    for (size_t i = 0; i < cloud->size(); i += sample_step) {
+        std::vector<int> indices(2);
+        std::vector<float> dists(2);
+        if (tree->nearestKSearch(i, 2, indices, dists) == 2) {
+            total_dist += std::sqrt(dists[1]);
+            count++;
+        }
+    }
+    // 800K point optimization: increase default spacing, reduce subsequent computation
+    float avg_spacing = count > 0 ? total_dist / count : 0.15f;
+
+    // 800K point optimization: minimize angle sensitivity, reduce angle computation overhead
+    float angle_sensitivity = std::min(0.2f, 0.03f / avg_spacing);
+
+    return { max_dim, avg_spacing, angle_sensitivity };
+}
+
+// Compute local angle feature for a point (simplified calculation)
+float computeLocalAngleFeature(const pcl::PointXYZ& point, PointCloudPtr cloud, KdTreePtr tree, float search_radius) {
+    std::vector<int> neighbors;
+    std::vector<float> dists;
+    // Large dataset neighbor requirement (only 2 needed, reduces search time)
+    if (tree->radiusSearch(point, search_radius, neighbors, dists) < 2)
+        return 0.0f;
+
+    // Simplified principal direction calculation (reduces matrix computation overhead)
+    Eigen::Vector4f centroid;
+    pcl::compute3DCentroid(*cloud, neighbors, centroid);
+    Eigen::Matrix3f covariance;
+    pcl::computeCovarianceMatrixNormalized(*cloud, neighbors, centroid, covariance);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(covariance);
+    Eigen::Vector3f eigen_vectors = solver.eigenvectors().col(0);  // Use only principal direction
+
+    // Simplified angle calculation
+    float angle_x = rad2deg(std::acos(std::min(1.0f, std::abs(eigen_vectors.x()))));  // Bounds checking optimization
+    float angle_y = rad2deg(std::acos(std::min(1.0f, std::abs(eigen_vectors.y()))));
+    return std::max(angle_x, angle_y);
+}
+
+// Optimized boundary point extraction (specialized downsampling for large datasets)
+PointCloudPtr extractBoundaryPoints(PointCloudPtr cloud, const CloudStats& stats) {
+    // 800K point optimization: significantly increase voxel size, drastically reduce point count
+    float voxel_size = std::max(15 * stats.avg_spacing, 0.15f);
+    PointCloudPtr cloud_downsampled(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::VoxelGrid<pcl::PointXYZ> voxelGrid;
+    voxelGrid.setInputCloud(cloud);
+    voxelGrid.setLeafSize(voxel_size, voxel_size, voxel_size);
+    voxelGrid.filter(*cloud_downsampled);
+    std::cout << "Points after downsampling: " << cloud_downsampled->size() << std::endl;
+
+    // 800K point optimization: significantly reduce number of neighbors for normal computation
+    int normal_k = std::min(6, (int)(2 / stats.avg_spacing));
+    pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    KdTreePtr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(cloud_downsampled);
+
+    ne.setInputCloud(cloud_downsampled);
+    ne.setSearchMethod(tree);
+    ne.setKSearch(normal_k);
+    ne.compute(*normals);
+
+    // Boundary extraction (minimal neighbor search)
+    pcl::BoundaryEstimation<pcl::PointXYZ, pcl::Normal, pcl::Boundary> be;
+    pcl::PointCloud<pcl::Boundary>::Ptr boundaries(new pcl::PointCloud<pcl::Boundary>);
+
+    be.setInputCloud(cloud_downsampled);
+    be.setInputNormals(normals);
+    be.setSearchMethod(tree);
+    // 800K point optimization: further reduce neighbors for boundary extraction
+    be.setKSearch(std::min(10, normal_k + 1));
+    be.setAngleThreshold(M_PI / 2.5);  // Lower sensitivity, fewer boundary points
+    be.compute(*boundaries);
+
+    // Extract boundary points (high angle threshold, reduce point count)
+    PointCloudPtr boundary_points(new pcl::PointCloud<pcl::PointXYZ>);
+    KdTreePtr angle_tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    angle_tree->setInputCloud(cloud_downsampled);
+    // 800K point optimization: increase angle search radius, reduce redundant computation
+    float angle_search_radius = std::max(15 * stats.avg_spacing, 0.25f);
+
+    for (size_t i = 0; i < cloud_downsampled->size(); ++i) {
+        float local_angle = computeLocalAngleFeature(
+            cloud_downsampled->points[i], cloud_downsampled, angle_tree, angle_search_radius);
+
+        // 800K point optimization: increase angle threshold, keep only prominent feature points
+        if (boundaries->points[i].boundary_point || local_angle > 60.0f) {
+            boundary_points->push_back(cloud_downsampled->points[i]);
+        }
+    }
+
+    // Outlier filtering (specialized parameters for large datasets)
+    pcl::RadiusOutlierRemoval<pcl::PointXYZ> outlier_removal;
+    outlier_removal.setInputCloud(boundary_points);
+    // 800K point optimization: increase outlier filtering radius, reduce retained points
+    outlier_removal.setRadiusSearch(std::max(15 * stats.avg_spacing, 0.4f));
+    outlier_removal.setMinNeighborsInRadius(1);
+    outlier_removal.filter(*boundary_points);
+
+    return boundary_points;
+}
+
+// Optimized point cloud thinning (skeleton simplification for large datasets)
+PointCloudPtr thinCloud(PointCloudPtr cloud, const CloudStats& stats, int iterations = 1) {
+    PointCloudPtr thinned_cloud(new pcl::PointCloud<pcl::PointXYZ>(*cloud));
+    KdTreePtr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    // 800K point optimization: increase search radius, reduce search frequency
+    float search_radius = std::max(15 * stats.avg_spacing, 0.2f);
+    // 800K point optimization: reduce minimum retention ratio
+    size_t min_keep = std::max<size_t>(3, cloud->size() * 0.003);
+
+    KdTreePtr angle_tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    angle_tree->setInputCloud(thinned_cloud);
+    // 800K point optimization: increase angle search radius
+    float angle_search_radius = std::max(15 * stats.avg_spacing, 0.25f);
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        PointCloudPtr temp_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        tree->setInputCloud(thinned_cloud);
+        angle_tree->setInputCloud(thinned_cloud);
+
+        for (size_t j = 0; j < thinned_cloud->size(); ++j) {
+            float local_angle = computeLocalAngleFeature(
+                thinned_cloud->points[j], thinned_cloud, angle_tree, angle_search_radius);
+
+            std::vector<int> neighbors;
+            std::vector<float> dists;
+            tree->radiusSearch(j, search_radius, neighbors, dists);
+
+            // 800K point optimization: stricter thinning strategy
+            if (local_angle > 60.0f) {  // Keep only higher angle points
+                temp_cloud->push_back(thinned_cloud->points[j]);
+            }
+            else if (neighbors.size() <= 8) {  // Stricter isolated point criteria
+                temp_cloud->push_back(thinned_cloud->points[j]);
+            }
+            else if (neighbors.size() < 20) {  // Fewer points retained in medium density regions
+                if (j % 8 == 0) {  // Larger retention interval
+                    temp_cloud->push_back(thinned_cloud->points[j]);
+                }
+            }
+            else {  // Extremely strict filtering in high density regions
+                if (j % 15 == 0) {  // Larger retention interval
+                    temp_cloud->push_back(thinned_cloud->points[j]);
+                }
+            }
+        }
+
+        thinned_cloud = temp_cloud;
+        if (thinned_cloud->size() < min_keep) break;  // Prevent over-thinning
+    }
+
+    return thinned_cloud;
+}
+
+// Optimized skeleton line computation (line simplification for large datasets)
+std::vector<pcl::Vertices> computeSkeletonLines(PointCloudPtr skeleton, const CloudStats& stats) {
+    std::vector<pcl::Vertices> lines;
+    if (skeleton->size() < 2) return lines;
+
+    KdTreePtr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(skeleton);
+    // 800K point optimization: increase base distance, reduce search frequency
+    float base_dist = stats.max_dim * 0.15f;
+    // 800K point optimization: increase angle search radius
+    float angle_search_radius = std::max(15 * stats.avg_spacing, 0.25f);
+
+    for (size_t i = 0; i < skeleton->size(); ++i) {
+        float local_angle = computeLocalAngleFeature(
+            skeleton->points[i], skeleton, tree, angle_search_radius);
+        // 800K point optimization: reduce angle's influence on distance weighting
+        float dynamic_dist = base_dist * (1.0f + std::min(0.15f, local_angle / 90.0f * stats.angle_sensitivity));
+
+        std::vector<int> neighbors;
+        std::vector<float> dists;
+        if (tree->radiusSearch(i, dynamic_dist, neighbors, dists) <= 1) continue;
+
+        int count = 0;
+        int max_connections = 1;  // All points connect to only 1 line, drastically reduce lines
+        for (size_t j = 0; j < neighbors.size() && count < max_connections; ++j) {
+            int neighbor_idx = neighbors[j];
+            // 800K point optimization: filter more short lines
+            if (neighbor_idx > static_cast<int>(i) && dists[j] > 0.06f) {
+                pcl::Vertices line;
+                line.vertices.push_back(static_cast<int>(i));
+                line.vertices.push_back(neighbor_idx);
+                lines.push_back(line);
+                count++;
+            }
+        }
+    }
+
+    return lines;
+}
+
+// Visualization optimization (lightweight rendering for large datasets)
+void visualizeSkeletonLines(PointCloudPtr skeleton, std::vector<pcl::Vertices> lines, const CloudStats& stats) {
+    pcl::visualization::PCLVisualizer viewer("Skeleton Lines (Large Dataset Mode)");
+    viewer.setBackgroundColor(1, 1, 1);  // Background color changed to white
+    viewer.removeAllPointClouds();  // Clear default rendering, reduce overhead
+
+    // Minimal sphere rendering (only show key skeleton points)
+    KdTreePtr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+    tree->setInputCloud(skeleton);
+    float angle_search_radius = std::max(15 * stats.avg_spacing, 0.25f);
+
+    for (size_t i = 0; i < skeleton->size(); ++i) {
+        float local_angle = computeLocalAngleFeature(
+            skeleton->points[i], skeleton, tree, angle_search_radius);
+        float r = std::min(1.0f, local_angle / 120.0f);  // Reduce color computation complexity
+        float g = 1.0f - r;
+        std::string id = "point_" + std::to_string(i);
+        // 800K point optimization: further reduce sphere size, decrease rendering load
+        viewer.addSphere(skeleton->points[i], 0.004f, r, g, 0, id);
+    }
+
+    // Thinnest line width rendering
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].vertices.size() >= 2) {
+            int idx1 = lines[i].vertices[0];
+            int idx2 = lines[i].vertices[1];
+            std::string line_id = "line_" + std::to_string(i);
+            viewer.addLine<pcl::PointXYZ>(
+                skeleton->points[idx1],
+                skeleton->points[idx2],
+                0.0f, 0.0f, 1.0f,  // Connection line color: blue
+                line_id
+            );
+            viewer.setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_LINE_WIDTH, 0.2, line_id);
+        }
+    }
+
+    viewer.addCoordinateSystem(1.0);
+    viewer.initCameraParameters();
+    viewer.resetCamera();
+
+    // 800K point optimization: reduce refresh rate, decrease resource usage
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce(250);  // Refresh interval extended to 250ms
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+// Original point cloud visualization (minimal mode for large datasets)
+void visualizeOriginalCloud(PointCloudPtr cloud) {
+    pcl::visualization::PCLVisualizer viewer("Original Point Cloud (Large Dataset Simplified Mode)");
+    viewer.setBackgroundColor(1, 1, 1);  // Background color changed to white
+
+    // 800K point optimization: earlier visualization downsampling
+    PointCloudPtr vis_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (cloud->size() > 300000) {  // Lower threshold, trigger downsampling earlier
+        pcl::VoxelGrid<pcl::PointXYZ> vis_filter;
+        vis_filter.setInputCloud(cloud);
+        vis_filter.setLeafSize(0.6f, 0.6f, 0.6f);  // Increase visualization downsampling voxel size
+        vis_filter.filter(*vis_cloud);
+        std::cout << "Points after original cloud visualization downsampling: " << vis_cloud->size() << std::endl;
+    }
+    else {
+        vis_cloud = cloud;
+    }
+
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> cloudColor(vis_cloud, 50, 50, 50);
+    viewer.addPointCloud(vis_cloud, cloudColor, "original_cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "original_cloud");
+    // 800K point optimization: further reduce original cloud opacity, decrease rendering pressure
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, 0.005, "original_cloud");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_LUT, 0, "original_cloud");
+
+    viewer.initCameraParameters();
+    viewer.resetCamera();
+
+    // 800K point optimization: reduce refresh rate
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce(250);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+int main(int argc, char** argv) {
+    // Large dataset processing optimization: limit memory usage
+    std::cout << "Enabling large dataset processing mode (800K point optimization)" << std::endl;
+    std::string inputFileName = "C:\\Users\\admin\\Desktop\\1\\点云实验\\daoluSG3.pcd";
+    std::string outputFileName = "skeleton.pcd";
+
+    if (argc >= 2) inputFileName = argv[1];
+    if (argc >= 3) outputFileName = argv[2];
+
+    // Read point cloud (enable binary accelerated reading)
+    PointCloudPtr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (pcl::io::loadPCDFile(inputFileName, *cloud) == -1) {
+        PCL_ERROR("Unable to read PCD file!\n");
+        return -1;
+    }
+    std::cout << "Successfully read point cloud, original points: " << cloud->size() << std::endl;
+
+    // Compute point cloud statistical features (fast estimation)
+    CloudStats stats = computeCloudStats(cloud);
+    std::cout << "Point cloud scale: max dimension=" << stats.max_dim
+        << "m, average point spacing=" << stats.avg_spacing << "m" << std::endl;
+
+    // Extract boundary points (drastically reduce data volume)
+    PointCloudPtr boundary_points = extractBoundaryPoints(cloud, stats);
+    std::cout << "Extracted boundary points: " << boundary_points->size() << std::endl;
+
+    // Skeleton refinement (extreme simplification)
+    PointCloudPtr skeleton = thinCloud(boundary_points, stats, 1);  // Only 1 iteration, reduce computation
+    std::cout << "Skeleton points: " << skeleton->size() << std::endl;
+
+    // Generate skeleton lines (minimal lines)
+    std::vector<pcl::Vertices> skeleton_lines = computeSkeletonLines(skeleton, stats);
+    std::cout << "Generated skeleton line segments: " << skeleton_lines.size() << std::endl;
+
+    // Save results (binary format for speed)
+    if (pcl::io::savePCDFileBinary(outputFileName, *skeleton) == -1) {  // Binary save faster
+        PCL_ERROR("Unable to save skeleton point cloud file!\n");
+        return -1;
+    }
+    std::cout << "Skeleton point cloud saved to: " << outputFileName << std::endl;
+
+    // Visualization (optional: can be commented out to speed up execution)
+    std::thread original_thread(&visualizeOriginalCloud, cloud);
+    std::thread skeleton_thread(&visualizeSkeletonLines, skeleton, skeleton_lines, stats);
+
+    original_thread.join();
+    skeleton_thread.join();
+
+    return 0;
+}
