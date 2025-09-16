@@ -1,0 +1,428 @@
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/common/centroid.h>
+#include <pcl/common/eigen.h>
+#include <pcl/filters/filter.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <Eigen/Dense>
+#include <vector>
+#include <memory>
+#include <cmath>
+#include <iostream>
+#include <algorithm>
+#include <numeric>
+
+
+class EnhancedPolynomialFilter
+{
+public:
+    struct Parameters
+    {
+        int min_poly_order = 1;
+        int max_poly_order = 3;
+        float alpha = 0.75f;
+        float epsilon = 1e-6f;
+        float gradient_threshold = 0.05f;
+        float curvature_threshold = 0.06f;
+        float feature_boost = 1.2f;
+        int min_neighbors = 25;
+    };
+
+    EnhancedPolynomialFilter(const Parameters& params = Parameters())
+        : params_(params) {
+    }
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr filter(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input_cloud)
+    {
+        auto output_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        output_cloud->resize(input_cloud->size());
+        output_cloud->is_dense = false;
+
+        pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+
+        ne.setInputCloud(input_cloud);
+        ne.setSearchMethod(tree);
+        ne.setKSearch(20);
+        ne.compute(*normals);
+
+        tree->setInputCloud(input_cloud);
+
+
+        float avg_spacing = computeAverageSpacing(input_cloud);
+        std::cout << "Average point spacing: " << avg_spacing << " m\n";
+
+        for (size_t i = 0; i < input_cloud->size(); ++i)
+        {
+            const auto& center_point = input_cloud->points[i];
+
+
+            if (!pcl::isFinite(center_point)) {
+                output_cloud->points[i] = center_point;
+                continue;
+            }
+
+
+            float curvature = std::abs(normals->points[i].curvature);
+            int adaptive_order = params_.min_poly_order;
+
+
+            if (curvature > params_.curvature_threshold) {
+                adaptive_order = params_.max_poly_order;
+            }
+
+
+            int L1 = 2 * adaptive_order + 5;
+            int L2 = (L1 - 1) / 2 + 1;
+
+
+            std::vector<int> coarse_indices;
+            std::vector<float> coarse_distances;
+            int coarse_neighbors = tree->nearestKSearch(center_point, L1, coarse_indices, coarse_distances);
+
+
+            if (coarse_neighbors < params_.min_neighbors)
+            {
+
+                output_cloud->points[i] = center_point;
+                continue;
+            }
+
+
+            Eigen::Vector3f centroid;
+            Eigen::Matrix3f covariance;
+            computeCovarianceMatrix(input_cloud, coarse_indices, centroid, covariance);
+
+
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eigen_solver(covariance);
+            if (eigen_solver.info() != Eigen::Success) {
+                output_cloud->points[i] = center_point;
+                continue;
+            }
+
+            Eigen::Matrix3f eigenvectors = eigen_solver.eigenvectors();
+
+
+            Eigen::Vector3f u = eigenvectors.col(2);
+            Eigen::Vector3f v = eigenvectors.col(1);
+            Eigen::Vector3f n = eigenvectors.col(0);
+
+
+            float coarse_result = 0.0f;
+            float coarse_variance = 0.0f;
+            processWindow(input_cloud, coarse_indices, centroid, u, v, n,
+                coarse_result, coarse_variance, adaptive_order, true);
+
+            float fine_result = 0.0f;
+            float max_gradient = 0.0f;
+            std::vector<int> fine_indices;
+            std::vector<float> fine_distances;
+            int fine_neighbors = tree->nearestKSearch(center_point, L2, fine_indices, fine_distances);
+
+            if (fine_neighbors >= params_.min_neighbors)
+            {
+                processWindow(input_cloud, fine_indices, centroid, u, v, n,
+                    fine_result, max_gradient, adaptive_order, false);
+            }
+            else
+            {
+                fine_result = coarse_result;
+            }
+
+
+            if (max_gradient > params_.gradient_threshold) {
+                coarse_result *= params_.feature_boost;
+                fine_result *= params_.feature_boost;
+            }
+
+
+            Eigen::Vector3f final_point;
+            if (max_gradient > params_.gradient_threshold)
+            {
+
+                Eigen::Vector3f coarse_point = reconstructPoint(coarse_result, centroid, n);
+                Eigen::Vector3f fine_point = reconstructPoint(fine_result, centroid, n);
+                final_point = params_.alpha * coarse_point + (1 - params_.alpha) * fine_point;
+            }
+            else
+            {
+
+                final_point = reconstructPoint(coarse_result, centroid, n);
+            }
+
+            output_cloud->points[i].getVector3fMap() = final_point;
+        }
+
+
+        std::vector<int> indices;
+        pcl::removeNaNFromPointCloud(*output_cloud, *output_cloud, indices);
+
+        return output_cloud;
+    }
+
+private:
+
+    float computeAverageSpacing(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud)
+    {
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(cloud);
+
+        float total_distance = 0.0f;
+        int valid_points = 0;
+
+        for (size_t i = 0; i < cloud->size(); i += 10)
+        {
+            std::vector<int> indices(2);
+            std::vector<float> distances(2);
+            if (tree->nearestKSearch(cloud->points[i], 2, indices, distances) == 2)
+            {
+                total_distance += std::sqrt(distances[1]);
+                valid_points++;
+            }
+        }
+
+        return valid_points > 0 ? total_distance / valid_points : 0.1f;
+    }
+
+    void computeCovarianceMatrix(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<int>& indices,
+        Eigen::Vector3f& centroid,
+        Eigen::Matrix3f& covariance)
+    {
+        centroid.setZero();
+        covariance.setZero();
+
+
+        for (int idx : indices)
+        {
+            centroid += cloud->points[idx].getVector3fMap();
+        }
+        centroid /= static_cast<float>(indices.size());
+
+        for (int idx : indices)
+        {
+            Eigen::Vector3f pt = cloud->points[idx].getVector3fMap() - centroid;
+            covariance += pt * pt.transpose();
+        }
+        covariance /= static_cast<float>(indices.size());
+    }
+
+    void processWindow(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+        const std::vector<int>& indices,
+        const Eigen::Vector3f& centroid,
+        const Eigen::Vector3f& u,
+        const Eigen::Vector3f& v,
+        const Eigen::Vector3f& n,
+        float& result,
+        float& metric,
+        int poly_order,
+        bool is_coarse)
+    {
+        const int num_points = indices.size();
+        const int poly_terms = (poly_order + 1) * (poly_order + 2) / 2;
+
+
+        Eigen::MatrixXf A(num_points, poly_terms);
+        Eigen::VectorXf Y(num_points);
+
+
+        std::vector<float> w_values;
+        w_values.reserve(num_points);
+
+
+        for (int i = 0; i < num_points; ++i)
+        {
+            const auto& pt = cloud->points[indices[i]];
+            Eigen::Vector3f relative_pos = pt.getVector3fMap() - centroid;
+
+
+            float u_val = relative_pos.dot(u);
+            float v_val = relative_pos.dot(v);
+            float w_val = relative_pos.dot(n);
+
+            w_values.push_back(w_val);
+
+
+            int col = 0;
+            for (int order = 0; order <= poly_order; ++order)
+            {
+                for (int j = 0; j <= order; ++j)
+                {
+                    int k = order - j;
+                    A(i, col++) = std::pow(u_val, j) * std::pow(v_val, k);
+                }
+            }
+
+            Y(i) = w_val;
+        }
+
+
+        Eigen::VectorXf weights = Eigen::VectorXf::Ones(num_points);
+        if (is_coarse) {
+            for (int i = 0; i < num_points; i++) {
+                float dist = std::sqrt(A(i, 1) * A(i, 1) + A(i, 2) * A(i, 2));
+                weights(i) = std::exp(-dist * dist / 2.0f);
+            }
+        }
+
+
+        Eigen::MatrixXf W = weights.asDiagonal();
+        Eigen::MatrixXf ATW = A.transpose() * W;
+        Eigen::VectorXf theta = (ATW * A).ldlt().solve(ATW * Y);
+
+
+        result = theta(0);
+
+
+        if (is_coarse)
+        {
+
+            float mean = std::accumulate(w_values.begin(), w_values.end(), 0.0f) / num_points;
+            float variance = 0.0f;
+            for (float w : w_values) variance += (w - mean) * (w - mean);
+            metric = variance / num_points;
+        }
+        else
+        {
+
+            float grad_u = 0.0f;
+            float grad_v = 0.0f;
+
+            int col = 1;
+            for (int order = 1; order <= poly_order; ++order)
+            {
+                for (int j = 0; j <= order; ++j)
+                {
+                    int k = order - j;
+                    if (j > 0) grad_u += theta(col) * j * std::pow(0.0f, j - 1) * std::pow(0.0f, k);
+                    if (k > 0) grad_v += theta(col) * std::pow(0.0f, j) * k * std::pow(0.0f, k - 1);
+                    col++;
+                }
+            }
+
+            float gradient_magnitude = std::sqrt(grad_u * grad_u + grad_v * grad_v);
+            metric = gradient_magnitude;
+        }
+    }
+
+
+    Eigen::Vector3f reconstructPoint(float w_value,
+        const Eigen::Vector3f& centroid,
+        const Eigen::Vector3f& n)
+    {
+
+        return centroid + w_value * n;
+    }
+
+    Parameters params_;
+};
+
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr bilateralFilter(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    float sigma_s = 0.5f,
+    float sigma_r = 0.05f)
+{
+    auto filtered_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>(*cloud);
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+    tree->setInputCloud(cloud);
+
+    const int k = 20;
+
+#pragma omp parallel for
+    for (size_t i = 0; i < cloud->size(); ++i)
+    {
+        std::vector<int> indices;
+        std::vector<float> distances;
+        if (tree->nearestKSearch(cloud->points[i], k, indices, distances) > 0)
+        {
+            Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+            float total_weight = 0.0f;
+
+            for (size_t j = 0; j < indices.size(); ++j)
+            {
+                const auto& pt = cloud->points[indices[j]];
+                float spatial_dist = std::sqrt(distances[j]);
+                float range_dist = (pt.getVector3fMap() - cloud->points[i].getVector3fMap()).norm();
+
+                float weight = std::exp(-(spatial_dist * spatial_dist) / (2 * sigma_s * sigma_s)) *
+                    std::exp(-(range_dist * range_dist) / (2 * sigma_r * sigma_r));
+
+                sum += weight * pt.getVector3fMap();
+                total_weight += weight;
+            }
+
+            if (total_weight > 0)
+            {
+                filtered_cloud->points[i].getVector3fMap() = sum / total_weight;
+            }
+        }
+    }
+    return filtered_cloud;
+}
+
+int main()
+{
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    const std::string input_file = R"(E:\\shuju\\Ê÷Ä¾.pcd)";
+
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(input_file, *cloud) == -1)
+    {
+        std::cerr << "Error: Failed to load PCD file: " << input_file << std::endl;
+        return -1;
+    }
+    std::cout << "Loaded building point cloud with " << cloud->size() << " points\n";
+
+
+    std::vector<int> indices;
+    pcl::removeNaNFromPointCloud(*cloud, *cloud, indices);
+    std::cout << "Removed " << indices.size() << " NaN/Inf points\n";
+
+
+    EnhancedPolynomialFilter::Parameters params;
+    params.min_poly_order = 1;
+    params.max_poly_order = 3;
+    params.alpha = 0.75f;
+    params.gradient_threshold = 0.05f;
+    params.curvature_threshold = 0.07f;
+    params.feature_boost = 1.2f;
+    params.min_neighbors = 25;
+
+    EnhancedPolynomialFilter filter(params);
+    auto filtered_cloud = filter.filter(cloud);
+    std::cout << "Stage 1: Polynomial filtering complete\n";
+
+    auto final_cloud = bilateralFilter(filtered_cloud, 1.0f, 0.1f);
+    std::cout << "Stage 2: Bilateral filtering complete\n";
+
+    const std::string output_file = R"(E:\shuju\lvbo\Ê÷Ä¾SG4.pcd)";
+    pcl::io::savePCDFileBinary(output_file, *final_cloud);
+    std::cout << "Enhanced filtered building saved to: " << output_file << std::endl;
+
+    pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("Enhanced 3D Building Filter"));
+    viewer->setBackgroundColor(0.1, 0.1, 0.2);
+
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> orig_color(cloud, 150, 150, 150);
+    viewer->addPointCloud<pcl::PointXYZ>(cloud, orig_color, "original_cloud");
+    viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "original_cloud");
+
+    pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZ> filtered_color(final_cloud, 0, 255, 0);
+    viewer->addPointCloud<pcl::PointXYZ>(final_cloud, filtered_color, "filtered_cloud");
+    viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 2, "filtered_cloud");
+
+    viewer->addCoordinateSystem(1.0);
+
+    std::cout << "Press 'q' to quit viewer\n";
+
+
+    while (!viewer->wasStopped()) {
+        viewer->spinOnce(100);
+    }
+
+    return 0;
+}

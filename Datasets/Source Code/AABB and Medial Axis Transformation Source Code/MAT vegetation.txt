@@ -1,0 +1,132 @@
+#include <iostream>
+#include <vector>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <thread>
+#include <chrono>
+#include <limits>
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+
+using PointT = pcl::PointXYZ;
+using PointCloudPtr = pcl::PointCloud<PointT>::Ptr;
+using KdTreePtr = pcl::search::KdTree<PointT>::Ptr;
+
+// 最小生成树连接骨架点
+std::vector<pcl::Vertices> mstConnection(PointCloudPtr skeleton) {
+    std::vector<pcl::Vertices> lines;
+    if (skeleton->size() < 2) return lines;
+
+    // 构建KDTree加速搜索
+    KdTreePtr tree(new pcl::search::KdTree<PointT>);
+    tree->setInputCloud(skeleton);
+
+    // Prim算法所需数据结构
+    std::vector<bool> inMST(skeleton->size(), false);       // 是否已加入MST
+    std::vector<float> minDist(skeleton->size(), std::numeric_limits<float>::max());  // 到MST的最小距离
+    std::vector<int> parent(skeleton->size(), -1);          // 父节点索引
+
+    // 从第一个点开始构建
+    minDist[0] = 0.0f;
+
+    for (size_t i = 0; i < skeleton->size(); ++i) {
+        // 找到距离MST最近的点
+        int u = -1;
+        float minVal = std::numeric_limits<float>::max();
+        for (size_t j = 0; j < skeleton->size(); ++j) {
+            if (!inMST[j] && minDist[j] < minVal) {
+                minVal = minDist[j];
+                u = j;
+            }
+        }
+
+        if (u == -1) break;  // 无法继续构建
+        inMST[u] = true;
+
+        // 更新邻点距离
+        std::vector<int> neighbors;
+        std::vector<float> dists;
+        if (tree->radiusSearch(u, 1.0f, neighbors, dists) > 0) {  // 搜索半径1.0f
+            for (size_t j = 0; j < neighbors.size(); ++j) {
+                int v = neighbors[j];
+                if (!inMST[v] && dists[j] < minDist[v]) {
+                    minDist[v] = dists[j];
+                    parent[v] = u;
+                }
+            }
+        }
+    }
+
+    // 生成连接线
+    for (size_t i = 1; i < skeleton->size(); ++i) {
+        if (parent[i] != -1) {
+            pcl::Vertices line;
+            line.vertices = { parent[i], static_cast<int>(i) };
+            lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+// 可视化函数
+void visualize(PointCloudPtr original, PointCloudPtr skeleton, const std::vector<pcl::Vertices>& lines) {
+    pcl::visualization::PCLVisualizer viewer("MST骨架连接");
+    viewer.setBackgroundColor(0, 0, 0);
+
+    // 原始点云（灰色低透明）
+    viewer.addPointCloud(original, pcl::visualization::PointCloudColorHandlerCustom<PointT>(original, 200, 200, 200), "original");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "original");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY, 0.2, "original");
+
+    // 骨架点（红色）
+    viewer.addPointCloud(skeleton, pcl::visualization::PointCloudColorHandlerCustom<PointT>(skeleton, 255, 0, 0), "skeleton");
+    viewer.setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 4, "skeleton");
+
+    // 连接线（绿色）
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string id = "line_" + std::to_string(i);
+        viewer.addLine(skeleton->points[lines[i].vertices[0]], skeleton->points[lines[i].vertices[1]], 0, 1, 0, id);
+        viewer.setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_LINE_WIDTH, 2, id);
+    }
+
+    viewer.addCoordinateSystem(1.0);
+    while (!viewer.wasStopped()) {
+        viewer.spinOnce(100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+// 骨架点提取（简化版距离变换法）
+PointCloudPtr extractSkeletonPoints(PointCloudPtr cloud) {
+    // 实际应用中可替换为更精确的骨架提取算法
+    PointCloudPtr skeleton(new pcl::PointCloud<PointT>);
+    pcl::VoxelGrid<PointT> voxel;
+    voxel.setInputCloud(cloud);
+    voxel.setLeafSize(0.05f, 0.05f, 0.05f);
+    voxel.filter(*skeleton);
+    return skeleton;
+}
+
+int main() {
+    // 读取点云
+    PointCloudPtr cloud(new pcl::PointCloud<PointT>);
+    std::string inputPath = "C:\\Users\\admin\\Desktop\\1\\点云实验\\plant.pcd";
+    if (pcl::io::loadPCDFile(inputPath, *cloud) == -1) {
+        PCL_ERROR("无法读取文件: %s\n", inputPath.c_str());
+        return -1;
+    }
+
+    // 提取骨架点
+    PointCloudPtr skeleton = extractSkeletonPoints(cloud);
+    std::cout << "骨架点数量: " << skeleton->size() << std::endl;
+
+    // MST连接
+    std::vector<pcl::Vertices> lines = mstConnection(skeleton);
+    std::cout << "MST连接线数量: " << lines.size() << std::endl;
+
+    // 可视化
+    visualize(cloud, skeleton, lines);
+    return 0;
+}
